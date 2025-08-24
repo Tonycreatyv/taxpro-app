@@ -4,3 +4,7 @@
 
 [functions]
   node_bundler = "esbuild"
+
+# Esta es la nueva sección que resuelve el problema
+[functions."*"]
+  external_node_modules = ["@google/generative-ai"]
