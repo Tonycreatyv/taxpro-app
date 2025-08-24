@@ -1,105 +1,90 @@
-import type { Context } from "@netlify/functions"
-import { createClient } from '@supabase/supabase-js'
+import { Handler } from "@netlify/functions";
+import { createClient } from '@supabase/supabase-js';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 
-// Interfaz para definir la estructura del webhook de Supabase
-interface WebhookPayload {
-  type: 'INSERT';
-  table: string;
-  record: {
-    id: number;
-    client_id: number;
-    file_path: string;
+// Función para convertir el archivo a la parte generativa que necesita Gemini
+function fileToGenerativePart(buffer: Buffer, mimeType: string) {
+  return {
+    inlineData: {
+      data: buffer.toString("base64"),
+      mimeType,
+    },
   };
 }
 
-const GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent"
-
-export default async (req: Request, context: Context) => {
-  const corsHeaders = {
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    'Access-Control-Allow-Methods': 'POST, OPTIONS',
-  }
-  if (req.method === 'OPTIONS') {
-    return new Response('ok', { headers: corsHeaders });
+const handler: Handler = async (event) => {
+  if (!event.body) {
+    return {
+      statusCode: 400,
+      body: JSON.stringify({ error: "No se recibió cuerpo en la solicitud." }),
+    };
   }
 
   try {
-    // --- OBTENER SECRETOS ---
-    const geminiApiKey = process.env.GEMINI_API_KEY;
-    const supabaseUrl = process.env.SUPABASE_URL;
-    const supabaseServiceKey = process.env.SUPABASE_SERVICE_KEY;
+    // 1. Extraer la ruta del archivo del webhook
+    const webhookPayload = JSON.parse(event.body);
+    const filePath = webhookPayload.record.file_path;
 
-    // --- CONECTAR A SUPABASE ---
-    const supabase = createClient(supabaseUrl!, supabaseServiceKey!);
-
-    // --- PROCESAR LA ENTRADA DEL WEBHOOK ---
-    const payload: WebhookPayload = await req.json();
-    const documentRecord = payload.record;
-
-    // --- DESCARGAR EL ARCHIVO DE SUPABASE STORAGE ---
-    const { data: fileBlob, error: downloadError } = await supabase.storage
-      .from('tax-documents') // Asegúrate de que este es el nombre de tu bucket
-      .download(documentRecord.file_path);
-
-    if (downloadError) throw downloadError;
-
-    // --- PREPARAR EL ARCHIVO PARA GEMINI ---
-    // Convertir el archivo a un formato que Gemini entiende (Base64)
-    const fileBuffer = await fileBlob.arrayBuffer();
-    const base64File = btoa(String.fromCharCode(...new Uint8Array(fileBuffer)));
-    const mimeType = fileBlob.type; // ej. "image/png" o "application/pdf"
-
-    // --- LLAMAR A LA API DE GEMINI CON EL ARCHIVO Y EL PROMPT ---
-    const prompt = `Analiza este documento fiscal. Extrae en formato JSON: el tipo de documento (W-2, 1099-INT, etc.), el año fiscal, el nombre del emisor y las cifras clave.`;
-    
-    const geminiResponse = await fetch(`${GEMINI_URL}?key=${geminiApiKey}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [
-          { parts: [{ text: prompt }] },
-          { parts: [{ inline_data: { mime_type: mimeType, data: base64File } }] }
-        ]
-      })
-    });
-
-    if (!geminiResponse.ok) {
-      throw new Error(`Error en la API de Gemini: ${geminiResponse.statusText}`);
+    if (!filePath) {
+      throw new Error("No se encontró file_path en el payload del webhook.");
     }
 
-    const responseData = await geminiResponse.json();
-    let analysisText = responseData.candidates[0].content.parts[0].text;
+    // 2. Conectar con Supabase
+    const supabase = createClient(
+      process.env.SUPABASE_URL!,
+      process.env.SUPABASE_ANON_KEY!
+    );
+
+    // 3. Descargar el archivo desde Supabase Storage
+    const { data: fileData, error: downloadError } = await supabase
+      .storage
+      .from('tax-documents') // Asegúrate que este es el nombre de tu bucket
+      .download(filePath);
+
+    if (downloadError) {
+      throw new Error(`Error al descargar el archivo: ${downloadError.message}`);
+    }
+
+    const buffer = Buffer.from(await fileData.arrayBuffer());
+    // Por ahora asumimos PDF, esto se puede mejorar después
+    const mimeType = "application/pdf"; 
+
+    // 4. Preparar la llamada a la API de Gemini
+    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+
+    const prompt = "Analiza este documento de impuestos. Extrae el tipo de documento (ej. W-2, 1099-NEC), el año fiscal, el nombre del emisor, y las cifras clave como ingresos totales. Proporciona un breve resumen. Responde únicamente en formato JSON.";
     
-    // Limpiar la respuesta de Gemini para que sea un JSON válido
-    analysisText = analysisText.replace(/```json\n|\n```/g, '');
-    const analysisJson = JSON.parse(analysisText);
+    const filePart = fileToGenerativePart(buffer, mimeType);
 
-    // --- GUARDAR EL ANÁLISIS EN LA BASE DE DATOS ---
-    const { error: insertError } = await supabase
-      .from('document_analyses')
-      .insert({
-        document_id: documentRecord.id,
-        status: 'completed',
-        document_type: analysisJson.tipo_de_documento,
-        tax_year: analysisJson.año_fiscal,
-        issuer_name: analysisJson.nombre_del_emisor,
-        key_figures: analysisJson.cifras_clave,
-        summary: 'Análisis completado por IA.'
-      });
+    const requestBody = {
+        contents: [{ parts: [filePart, { text: prompt }] }],
+    };
 
-    if (insertError) throw insertError;
+    // ==================================================================
+    // LÍNEA CLAVE DE DEPURACIÓN: Imprime el cuerpo de la petición en el log
+    console.log("Enviando el siguiente cuerpo de solicitud a Gemini:", JSON.stringify(requestBody, null, 2));
+    // ==================================================================
 
-    // --- DEVOLVER RESPUESTA DE ÉXITO ---
-    return new Response(JSON.stringify({ success: true, analysis: analysisJson }), {
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-    });
+    // 5. Llamar a la API de Gemini
+    const result = await model.generateContent(requestBody);
+    const response = result.response;
+    const analysisText = response.text();
+
+    console.log("Respuesta de Gemini:", analysisText);
+    
+    return {
+      statusCode: 200,
+      body: JSON.stringify({ success: true, analysis: analysisText }),
+    };
 
   } catch (error) {
-    console.error(error);
-    return new Response(JSON.stringify({ error: error.message }), {
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      status: 500,
-    });
+    console.error("Error en la función analyze-document:", error);
+    return {
+      statusCode: 500,
+      body: JSON.stringify({ error: `Error en la API de Gemini: ${error.message}` }),
+    };
   }
 };
+
+export { handler };
